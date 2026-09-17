@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import Response, JSONResponse
 
 from . import service
@@ -60,6 +60,15 @@ def claim_tasks(body: ClaimIn) -> dict:
 @app.get("/tasks")
 def list_tasks(dag_id: str | None = None, state: str | None = None) -> dict:
     return service.list_tasks(dag_id, state)
+
+
+@app.get("/events")
+def list_events(
+    after: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    dag_id: str | None = None,
+) -> dict:
+    return service.list_events(after, limit, dag_id)
 
 
 @app.get("/tasks/{task_id}")

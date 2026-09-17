@@ -110,9 +110,23 @@ def init_db(path: Path | None = None) -> None:
                 PRIMARY KEY (task_id, completion_id)
             );
 
+            -- 不可变事件流：与状态变更在同一事务内追加，事务回滚则事件一并消失。
+            -- sequence 由 AUTOINCREMENT 保证单调递增，作为跨页/重启消费的游标。
+            CREATE TABLE IF NOT EXISTS events (
+                sequence     INTEGER PRIMARY KEY AUTOINCREMENT,
+                type         TEXT NOT NULL,   -- dag.created / task.{claimed,requeued,succeeded,failed,blocked}
+                dag_id       TEXT NOT NULL,
+                task_id      TEXT,
+                attempt      INTEGER,
+                from_state   TEXT,
+                to_state     TEXT,
+                occurred_at  TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_tasks_dag_state ON tasks(dag_id, state);
             CREATE INDEX IF NOT EXISTS idx_deps_dep ON dependencies(dag_id, dep_key);
             CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id, attempt_no);
+            CREATE INDEX IF NOT EXISTS idx_events_dag_seq ON events(dag_id, sequence);
             """
         )
 

@@ -563,3 +563,192 @@ def test_concurrent_claim_is_atomic(client):
     assert not errors
     assert len(results) == 1
     assert results[0]["attempt"] == 1
+
+
+# ------------------------------------------------------------- 事件流
+
+def _events(client, **params):
+    r = client.get("/events", params=params)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_dag_created_event(client):
+    dag = submit(client, [{"key": "a"}])
+    body = _events(client)
+    assert [e["type"] for e in body["events"]] == ["dag.created"]
+    ev = body["events"][0]
+    assert ev["sequence"] == 1
+    assert ev["dag_id"] == dag["id"]
+    # 创建事件的可空字段为空
+    assert ev["task_id"] is None
+    assert ev["attempt"] is None
+    assert ev["from_state"] is None
+    assert ev["to_state"] is None
+    assert ev["occurred_at"]
+    assert body["next_after"] == 1
+
+
+def test_task_lifecycle_events(client):
+    dag = submit(client, [{"key": "a", "max_retries": 1}])
+    t1 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    # 第一次显式失败：重排回 pending
+    client.post(f"/tasks/{t1['task_id']}/complete",
+                json={"completion_id": "ev1", "lease_token": t1["lease_token"],
+                      "success": False, "error": "boom"})
+    t2 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    client.post(f"/tasks/{t2['task_id']}/complete",
+                json={"completion_id": "ev2", "lease_token": t2["lease_token"],
+                      "success": True})
+
+    events = _events(client)["events"]
+    assert [e["type"] for e in events] == [
+        "dag.created", "task.claimed", "task.requeued", "task.claimed", "task.succeeded",
+    ]
+    assert [e["sequence"] for e in events] == [1, 2, 3, 4, 5]
+    assert all(e["dag_id"] == dag["id"] for e in events)
+
+    claimed1, requeued, claimed2, succeeded = events[1:]
+    assert claimed1["task_id"] == t1["task_id"]
+    assert claimed1["attempt"] == 1
+    assert (claimed1["from_state"], claimed1["to_state"]) == ("pending", "running")
+    assert requeued["attempt"] == 1
+    assert (requeued["from_state"], requeued["to_state"]) == ("running", "pending")
+    assert claimed2["attempt"] == 2
+    assert (claimed2["from_state"], claimed2["to_state"]) == ("pending", "running")
+    assert succeeded["attempt"] == 2
+    assert (succeeded["from_state"], succeeded["to_state"]) == ("running", "succeeded")
+
+
+def test_final_failure_and_blocked_events(client):
+    dag = submit(client, [
+        {"key": "a", "max_retries": 0},
+        {"key": "b", "deps": ["a"]},
+        {"key": "c", "deps": ["b"]},
+    ])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    client.post(f"/tasks/{t['task_id']}/complete",
+                json={"completion_id": "fatal", "lease_token": t["lease_token"],
+                      "success": False, "error": "fatal"})
+
+    events = _events(client)["events"]
+    assert [e["type"] for e in events] == [
+        "dag.created", "task.claimed", "task.failed", "task.blocked", "task.blocked",
+    ]
+    failed = events[2]
+    assert failed["task_id"] == t["task_id"] and failed["attempt"] == 1
+    assert (failed["from_state"], failed["to_state"]) == ("running", "failed")
+
+    full = client.get(f"/dags/{dag['id']}").json()
+    expected_blocked = {by_key(full, "b")["id"], by_key(full, "c")["id"]}
+    blocked = events[3:]
+    assert {e["task_id"] for e in blocked} == expected_blocked
+    for e in blocked:
+        assert e["to_state"] == "blocked"
+        assert e["from_state"] == "pending"  # 被阻塞时尚未领取
+        assert e["attempt"] is None
+
+
+def test_failed_submit_leaves_no_events(client):
+    # 校验失败（422）与重复 id（409）都回滚，不产生任何事件
+    assert client.post("/dags", json={"tasks": [{"key": "a", "deps": ["ghost"]}]}).status_code == 422
+    submit(client, [{"key": "a"}], dag_id="dup")
+    assert client.post("/dags", json={"id": "dup", "tasks": [{"key": "b"}]}).status_code == 409
+    body = _events(client)
+    assert [e["type"] for e in body["events"]] == ["dag.created"]
+
+
+def test_idempotent_replay_appends_no_extra_events(client):
+    submit(client, [{"key": "a"}])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    payload = {"completion_id": "idem", "lease_token": t["lease_token"], "success": True}
+    r1 = client.post(f"/tasks/{t['task_id']}/complete", json=payload)
+    r2 = client.post(f"/tasks/{t['task_id']}/complete", json=payload)
+    assert r2.text == r1.text
+    events = _events(client)["events"]
+    assert [e["type"] for e in events] == ["dag.created", "task.claimed", "task.succeeded"]
+
+
+def test_events_pagination_no_gaps_no_duplicates(client):
+    submit(client, [{"key": "a", "max_retries": 10}])
+    for i in range(5):  # 每轮 claim + requeue 各产生一条事件
+        t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+        client.post(f"/tasks/{t['task_id']}/complete",
+                    json={"completion_id": f"pg{i}", "lease_token": t["lease_token"],
+                          "success": False, "error": "x"})
+    # 共 1 + 5*2 = 11 条；以 limit=4 翻页，序列必须连续无重复
+    seen, after = [], 0
+    while True:
+        body = _events(client, after=after, limit=4)
+        if not body["events"]:
+            assert body["next_after"] == after  # 空页沿用 after
+            break
+        seen.extend(e["sequence"] for e in body["events"])
+        after = body["next_after"]
+        assert after == seen[-1]
+    assert seen == list(range(1, 12))
+
+
+def test_events_default_limit_50(client):
+    submit(client, [{"key": "a", "max_retries": 100}])
+    for i in range(30):  # 共 1 + 30*2 = 61 条事件
+        t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+        client.post(f"/tasks/{t['task_id']}/complete",
+                    json={"completion_id": f"d{i}", "lease_token": t["lease_token"],
+                          "success": False, "error": "x"})
+    body = _events(client)  # 默认 after=0、limit=50
+    assert len(body["events"]) == 50
+    assert body["events"][0]["sequence"] == 1
+    assert body["next_after"] == 50
+    rest = _events(client, after=body["next_after"])
+    assert [e["sequence"] for e in rest["events"]] == list(range(51, 62))
+    assert rest["next_after"] == 61
+
+
+def test_events_empty_page_keeps_after(client):
+    submit(client, [{"key": "a"}])
+    body = _events(client, after=999)
+    assert body["events"] == []
+    assert body["next_after"] == 999
+
+
+def test_events_filter_by_dag_id(client):
+    d1 = submit(client, [{"key": "a"}])
+    d2 = submit(client, [{"key": "b"}])
+    client.post("/tasks/claim", json={"dag_id": d1["id"]})
+    body = _events(client, dag_id=d2["id"])
+    assert [e["type"] for e in body["events"]] == ["dag.created"]
+    assert all(e["dag_id"] == d2["id"] for e in body["events"])
+
+
+def test_events_param_validation(client):
+    assert client.get("/events", params={"limit": 0}).status_code == 422
+    assert client.get("/events", params={"limit": 101}).status_code == 422
+    assert client.get("/events", params={"after": -1}).status_code == 422
+    assert client.get("/events", params={"limit": 100}).status_code == 200
+
+
+def test_events_survive_restart(tmp_path, monkeypatch):
+    """事件持久化在 SQLite 中：重启后 sequence 连续，不漏不重。"""
+    db_file = tmp_path / "events.db"
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("DEFAULT_LEASE_SECONDS", "30")
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as c1:
+        submit(c1, [{"key": "a"}])
+        t = c1.post("/tasks/claim", json={}).json()["claimed"][0]
+
+    # 模拟进程重启：旧库中的事件仍在，新事件继续递增
+    with TestClient(app) as c2:
+        body = c2.get("/events").json()
+        assert [e["type"] for e in body["events"]] == ["dag.created", "task.claimed"]
+        c2.post(f"/tasks/{t['task_id']}/complete",
+                json={"completion_id": "after-restart",
+                      "lease_token": t["lease_token"], "success": True})
+        body = c2.get("/events").json()
+        assert [e["sequence"] for e in body["events"]] == [1, 2, 3]
+        assert body["events"][2]["type"] == "task.succeeded"
+        assert body["next_after"] == 3

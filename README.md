@@ -28,6 +28,10 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   与显式失败计数一致，不因租约过期重领而减少。
 - **状态接口**：DAG 概览给出各状态计数；任务详情列出每次尝试的状态、租约令牌、
   过期时间、心跳时间、错误信息，以及当前租约是否已过期和阻塞原因。
+- **持久化事件流**：DAG 创建与任务领取、失败重排、成功、最终失败、阻塞都会在
+  状态变更的**同一事务**内追加一条不可变事件（回滚不留事件）。事件带单调递增的
+  `sequence`，通过 `GET /events?after=&limit=&dag_id=` 以游标分页消费，
+  跨页与服务重启不漏项、不重复。
 
 ## 一条命令启动（端口 8000）
 
@@ -179,6 +183,42 @@ curl -s 'http://localhost:8000/tasks?state=blocked'
 被阻塞后继示例：`{"key": "load", "state": "blocked", "blocked_reason":
 "upstream 'transform' permanently failed", "lease": null}`。
 
+### 6. 事件流（游标分页）
+
+每次状态变更都会在同一事务内追加一条不可变事件：`dag.created` 与
+`task.{claimed, requeued, succeeded, failed, blocked}`。
+
+```bash
+# 从开头消费（after 默认 0，limit 默认 50，范围 1~100）
+curl -s 'http://localhost:8000/events' | jq
+
+# 用上一页返回的 next_after 继续翻页；可按 dag_id 过滤
+curl -s 'http://localhost:8000/events?after=120&limit=100&dag_id=<DAG_ID>' | jq
+```
+
+响应示例：
+
+```json
+{
+  "events": [
+    {"sequence": 1, "type": "dag.created", "dag_id": "…",
+     "task_id": null, "attempt": null, "from_state": null, "to_state": null,
+     "occurred_at": "2026-09-17T11:00:00Z"},
+    {"sequence": 2, "type": "task.claimed", "dag_id": "…", "task_id": "…",
+     "attempt": 1, "from_state": "pending", "to_state": "running",
+     "occurred_at": "2026-09-17T11:00:01Z"}
+  ],
+  "next_after": 2
+}
+```
+
+- 事件按 `sequence` 严格升序返回；`next_after` 是下一页的游标（本页最后一条
+  事件的 `sequence`），空页时 `next_after` 沿用请求中的 `after`。
+- 事件持久化在 SQLite 中，与状态变更同事务提交：回滚不留事件；重启后从
+  `next_after` 继续消费，不漏项、不重复。
+- `dag.created` 的 `task_id`/`attempt`/`from_state`/`to_state` 为 `null`；
+  从未被领取就被阻塞的任务，其 `task.blocked` 事件的 `attempt` 也为 `null`。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -190,6 +230,7 @@ curl -s 'http://localhost:8000/tasks?state=blocked'
 | `GET` | `/tasks/{task_id}` | 任务详情：尝试历史、租约、阻塞原因 |
 | `POST` | `/tasks/{task_id}/heartbeat` | 凭当前租约令牌续租 |
 | `POST` | `/tasks/{task_id}/complete` | 凭租约令牌 + `completion_id` 幂等回报成功/失败 |
+| `GET` | `/events?after=&limit=&dag_id=` | 事件流：按 `sequence` 游标分页（`after` 默认 0，`limit` 默认 50，范围 1~100） |
 | `GET` | `/health` | 健康检查 |
 
 ## 任务状态机
@@ -212,4 +253,4 @@ pytest -q
 测试覆盖：DAG 校验（缺失依赖/环/重复键）、依赖门控、并发原子领取、
 attempt 递增与令牌唯一、过期后旧令牌 409、心跳续租、重试与耗尽后递归阻塞、
 幂等回报（重放同响应、内容冲突 409、键序等价、重启后持久化）、旧 SQLite 数据迁移、
-状态接口。
+状态接口、事件流（同事务追加、回滚不留事件、游标分页不漏不重、重启后连续）。

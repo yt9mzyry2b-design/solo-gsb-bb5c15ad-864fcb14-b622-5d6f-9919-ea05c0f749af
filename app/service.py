@@ -22,6 +22,14 @@ A_EXPIRED = "expired"
 A_SUCCEEDED = "succeeded"
 A_FAILED = "failed"
 
+# 事件类型（持久化事件流）
+EV_DAG_CREATED = "dag.created"
+EV_TASK_CLAIMED = "task.claimed"
+EV_TASK_REQUEUED = "task.requeued"
+EV_TASK_SUCCEEDED = "task.succeeded"
+EV_TASK_FAILED = "task.failed"
+EV_TASK_BLOCKED = "task.blocked"
+
 
 class APIError(Exception):
     def __init__(self, status_code: int, code: str, message: str, details: Any = None):
@@ -64,6 +72,25 @@ def _dumps(value: Any) -> str | None:
 def _canonical(value: Any) -> str:
     """规范化 JSON：递归排序对象键，使键序不同但内容相同的请求视为等价。"""
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _append_event(
+    conn,
+    type_: str,
+    dag_id: str,
+    *,
+    task_id: str | None = None,
+    attempt: int | None = None,
+    from_state: str | None = None,
+    to_state: str | None = None,
+    occurred_at: str | None = None,
+) -> None:
+    """在调用方的事务内追加一条不可变事件；事务回滚则事件一并消失。"""
+    conn.execute(
+        """INSERT INTO events (type, dag_id, task_id, attempt, from_state, to_state, occurred_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (type_, dag_id, task_id, attempt, from_state, to_state, occurred_at or _iso(_now())),
+    )
 
 
 # ---------------------------------------------------------------- DAG 提交
@@ -174,6 +201,8 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
                         "INSERT INTO dependencies (dag_id, task_key, dep_key) VALUES (?, ?, ?)",
                         (dag_id, key, dep),
                     )
+            # 创建事件：可空字段（task_id/attempt/from_state/to_state）为空
+            _append_event(conn, EV_DAG_CREATED, dag_id, occurred_at=now)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -249,6 +278,17 @@ def claim_tasks(worker_id: str | None, dag_id: str | None, limit: int) -> dict[s
                            leased_at, expires_at, state)
                        VALUES (?, ?, ?, ?, ?, ?, 'active')""",
                     (row["id"], attempt_no, token, worker_id, _iso(now), _iso(expires)),
+                )
+                # from_state 为领取前状态：pending（首次/重排后）或 running（租约过期重领）
+                _append_event(
+                    conn,
+                    EV_TASK_CLAIMED,
+                    row["dag_id"],
+                    task_id=row["id"],
+                    attempt=attempt_no,
+                    from_state=row["state"],
+                    to_state=RUNNING,
+                    occurred_at=_iso(now),
                 )
                 claimed.append(
                     {
@@ -370,6 +410,16 @@ def _block_descendants(conn, dag_id: str, root_key: str) -> int:
             "UPDATE attempts SET state = 'expired' WHERE task_id = ? AND state = 'active'",
             (target["id"],),
         )
+        # 从未被领取的任务没有有效尝试号，attempt 记为空
+        _append_event(
+            conn,
+            EV_TASK_BLOCKED,
+            dag_id,
+            task_id=target["id"],
+            attempt=target["attempt"] or None,
+            from_state=target["state"],
+            to_state=BLOCKED,
+        )
         count += 1
     return count
 
@@ -428,6 +478,11 @@ def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any] | Replay
                     "UPDATE attempts SET state = 'succeeded' WHERE lease_token = ?",
                     (token,),
                 )
+                _append_event(
+                    conn, EV_TASK_SUCCEEDED, row["dag_id"],
+                    task_id=task_id, attempt=row["attempt"],
+                    from_state=RUNNING, to_state=SUCCEEDED, occurred_at=_iso(now),
+                )
                 state = SUCCEEDED
             else:
                 # 显式失败才消耗重试预算：在同一事务内原子递增独立计数，
@@ -452,6 +507,11 @@ def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any] | Replay
                         "UPDATE attempts SET state = 'failed', error = ? WHERE lease_token = ?",
                         (error, token),
                     )
+                    _append_event(
+                        conn, EV_TASK_REQUEUED, row["dag_id"],
+                        task_id=task_id, attempt=row["attempt"],
+                        from_state=RUNNING, to_state=PENDING, occurred_at=_iso(now),
+                    )
                     state = PENDING
                 else:
                     conn.execute(
@@ -463,6 +523,11 @@ def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any] | Replay
                     conn.execute(
                         "UPDATE attempts SET state = 'failed', error = ? WHERE lease_token = ?",
                         (error, token),
+                    )
+                    _append_event(
+                        conn, EV_TASK_FAILED, row["dag_id"],
+                        task_id=task_id, attempt=row["attempt"],
+                        from_state=RUNNING, to_state=FAILED, occurred_at=_iso(now),
                     )
                     state = FAILED
                     blocked_count = _block_descendants(conn, row["dag_id"], row["task_key"])
@@ -628,3 +693,32 @@ def list_tasks(dag_id: str | None, state: str | None) -> dict[str, Any]:
     with get_conn() as conn:
         rows = conn.execute(sql, params).fetchall()
         return {"tasks": [_task_dict(conn, r, with_attempts=False) for r in rows], "count": len(rows)}
+
+
+# ---------------------------------------------------------------- 事件流
+
+def list_events(after: int, limit: int, dag_id: str | None) -> dict[str, Any]:
+    """按 sequence 升序返回事件页；next_after 为下一页游标，空页沿用 after。"""
+    sql = "SELECT * FROM events WHERE sequence > ?"
+    params: list[Any] = [after]
+    if dag_id is not None:
+        sql += " AND dag_id = ?"
+        params.append(dag_id)
+    sql += " ORDER BY sequence LIMIT ?"
+    params.append(limit)
+    with get_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    events = [
+        {
+            "sequence": r["sequence"],
+            "type": r["type"],
+            "dag_id": r["dag_id"],
+            "task_id": r["task_id"],
+            "attempt": r["attempt"],
+            "from_state": r["from_state"],
+            "to_state": r["to_state"],
+            "occurred_at": r["occurred_at"],
+        }
+        for r in rows
+    ]
+    return {"events": events, "next_after": events[-1]["sequence"] if events else after}
