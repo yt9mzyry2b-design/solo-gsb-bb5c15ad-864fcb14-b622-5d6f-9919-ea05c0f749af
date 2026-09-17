@@ -26,6 +26,16 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   JSON 对象键序不同不影响等价判定。幂等记录持久化在 SQLite 中，服务重启后仍有效。
 - **剩余额度**：状态响应中的 `retries_remaining = max(0, max_retries - failure_count)`，
   与显式失败计数一致，不因租约过期重领而减少。
+- **持久化事件流**：所有关键状态变迁都在**同一事务**内向只增（append-only）的事件流
+  追加一条不可变事件——`dag.created`（DAG 创建）以及
+  `task.claimed`（领取/过期重领）、`task.requeued`（失败重排）、
+  `task.succeeded`（成功）、`task.failed`（最终失败）、`task.blocked`（后继被阻塞）。
+  事件与业务变更同生共死：事务回滚（如图校验之后的插入冲突）不留任何事件；
+  幂等重放与 4xx 错误路径不产生事件。事件含全局严格递增的 `sequence`、`dag_id`、
+  可空的 `task_id`/`attempt`/`from_state`/`to_state` 与 `occurred_at`
+  （`dag.created` 的可空字段均为 `null`）。事件流持久化在 SQLite 中并由数据库触发器
+  禁止 `UPDATE`/`DELETE`，可通过 `GET /events` 按 `sequence` 升序键集分页拉取，
+  跨页与重启均不漏项、不重复。
 - **状态接口**：DAG 概览给出各状态计数；任务详情列出每次尝试的状态、租约令牌、
   过期时间、心跳时间、错误信息，以及当前租约是否已过期和阻塞原因。
 
@@ -179,6 +189,71 @@ curl -s 'http://localhost:8000/tasks?state=blocked'
 被阻塞后继示例：`{"key": "load", "state": "blocked", "blocked_reason":
 "upstream 'transform' permanently failed", "lease": null}`。
 
+### 6. 事件流
+
+事件流只增不改，记录全部关键状态变迁。每条事件形如：
+
+```json
+{
+  "sequence": 7,
+  "type": "task.claimed",
+  "dag_id": "9f1c…",
+  "task_id": "2b7e…",
+  "attempt": 1,
+  "from_state": "pending",
+  "to_state": "running",
+  "occurred_at": "2026-09-17T11:00:00Z"
+}
+```
+
+- `type` ∈ `dag.created` / `task.claimed` / `task.requeued` /
+  `task.succeeded` / `task.failed` / `task.blocked`；
+- `sequence` 为全局严格递增游标，事件按其升序返回；`dag.created` 事件的
+  `task_id`、`attempt`、`from_state`、`to_state` 均为 `null`；
+- 事件与对应业务变更在同一事务提交，回滚不留事件；存储层禁止
+  `UPDATE`/`DELETE`，保证不可变。
+
+拉取接口采用键集分页，`after` 为不透明游标，`limit` 取 1～100
+（默认 `after=0`、`limit=50`），可选 `dag_id` 只看单个 DAG：
+
+```bash
+curl -s 'http://localhost:8000/events?after=0&limit=50'
+```
+
+```json
+{
+  "events": [
+    {"sequence": 1, "type": "dag.created", "dag_id": "d1", "task_id": null,
+     "attempt": null, "from_state": null, "to_state": null,
+     "occurred_at": "2026-09-17T10:59:59Z"},
+    {"sequence": 2, "type": "task.claimed", "dag_id": "d1", "task_id": "…",
+     "attempt": 1, "from_state": "pending", "to_state": "running",
+     "occurred_at": "2026-09-17T11:00:00Z"}
+  ],
+  "next_after": 2
+}
+```
+
+翻页时把上一页的 `next_after` 原样作为下次请求的 `after`；空页
+（已到流末尾，或指定 `dag_id` 下暂无新事件）的 `next_after` 沿用传入的 `after`。
+事件与游标都持久化在 `task-data` 卷中，逐页追赶在跨页、服务重启后都不会漏项或重复。
+
+```bash
+# 只订阅某个 DAG 的事件，每页 100 条
+curl -s 'http://localhost:8000/events?dag_id=<DAG_ID>&after=0&limit=100'
+```
+
+状态变迁与事件 `type` 的对应关系：
+
+| 业务动作 | 事件 type | from_state → to_state |
+| --- | --- | --- |
+| DAG 创建 | `dag.created` | 可空字段均为 `null` |
+| 首次领取 / 过期重领 | `task.claimed` | `pending`（或 `running`）→ `running` |
+| 显式失败、仍有重试额度 | `task.requeued` | `running` → `pending` |
+| 回报成功 | `task.succeeded` | `running` → `succeeded` |
+| 显式失败、重试耗尽 | `task.failed` | `running` → `failed` |
+| 递归阻塞后继 | `task.blocked` | 原状态（`pending`/`running`）→ `blocked` |
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -187,6 +262,7 @@ curl -s 'http://localhost:8000/tasks?state=blocked'
 | `GET` | `/dags/{dag_id}` | DAG 概览：状态计数与任务列表 |
 | `POST` | `/tasks/claim` | 原子领取前置全部成功的任务 |
 | `GET` | `/tasks?dag_id=&state=` | 任务列表（可过滤） |
+| `GET` | `/events?after=&limit=&dag_id=` | 不可变事件流：按 sequence 升序键集分页 |
 | `GET` | `/tasks/{task_id}` | 任务详情：尝试历史、租约、阻塞原因 |
 | `POST` | `/tasks/{task_id}/heartbeat` | 凭当前租约令牌续租 |
 | `POST` | `/tasks/{task_id}/complete` | 凭租约令牌 + `completion_id` 幂等回报成功/失败 |
@@ -212,4 +288,5 @@ pytest -q
 测试覆盖：DAG 校验（缺失依赖/环/重复键）、依赖门控、并发原子领取、
 attempt 递增与令牌唯一、过期后旧令牌 409、心跳续租、重试与耗尽后递归阻塞、
 幂等回报（重放同响应、内容冲突 409、键序等价、重启后持久化）、旧 SQLite 数据迁移、
-状态接口。
+状态接口、持久化事件流（各事件类型与状态对、同事务回滚不留事件、重放不产生事件、
+键集分页无漏项/重复、dag_id 过滤、参数校验、重启后不重置、存储层不可变）。

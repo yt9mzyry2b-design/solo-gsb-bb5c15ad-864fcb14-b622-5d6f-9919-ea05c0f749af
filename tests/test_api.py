@@ -563,3 +563,243 @@ def test_concurrent_claim_is_atomic(client):
     assert not errors
     assert len(results) == 1
     assert results[0]["attempt"] == 1
+
+
+# ------------------------------------------------------------- 事件流
+
+def _all_events(client, **params):
+    """逐页拉取全部事件，断言跨页无重复/遗漏。"""
+    seen = []
+    after = params.get("after", 0)
+    while True:
+        page = client.get("/events", params={**params, "after": after}).json()
+        seqs = [e["sequence"] for e in page["events"]]
+        assert seqs == sorted(seqs) and len(seqs) == len(set(seqs))
+        seen.extend(page["events"])
+        if not page["events"]:
+            assert page["next_after"] == after  # 空页沿用 after
+            break
+        assert page["next_after"] == seqs[-1]
+        after = page["next_after"]
+    return seen
+
+
+def test_dag_created_event_nulls_task_fields(client):
+    dag = submit(client, [{"key": "a"}], dag_id="dag-evt-1")
+    events = client.get("/events", params={"dag_id": "dag-evt-1"}).json()["events"]
+    assert len(events) == 1
+    e = events[0]
+    assert e["sequence"] >= 1
+    assert e["type"] == "dag.created"
+    assert e["dag_id"] == dag["id"]
+    assert e["task_id"] is None
+    assert e["attempt"] is None
+    assert e["from_state"] is None
+    assert e["to_state"] is None
+    assert e["occurred_at"]  # 非空时间戳
+
+
+def test_task_lifecycle_event_sequence(client):
+    dag = submit(
+        client,
+        [
+            {"key": "a", "max_retries": 1},
+            {"key": "b", "deps": ["a"]},
+        ],
+    )
+    dag_id = dag["id"]
+
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    evts = client.get("/events", params={"dag_id": dag_id}).json()["events"]
+    claimed = evts[-1]
+    assert claimed["type"] == "task.claimed"
+    assert claimed["task_id"] == t["task_id"]
+    assert claimed["attempt"] == 1
+    assert claimed["from_state"] == "pending"
+    assert claimed["to_state"] == "running"
+
+    # 显式失败但仍有额度 -> requeued: running -> pending
+    r = client.post(f"/tasks/{t['task_id']}/complete",
+                    json={"completion_id": "c-fail", "lease_token": t["lease_token"],
+                          "success": False, "error": "boom"})
+    assert r.status_code == 200
+    evts = client.get("/events", params={"dag_id": dag_id}).json()["events"]
+    requeued = evts[-1]
+    assert requeued["type"] == "task.requeued"
+    assert requeued["attempt"] == 1
+    assert requeued["from_state"] == "running"
+    assert requeued["to_state"] == "pending"
+
+    # 重新领取 -> claimed（pending -> running，attempt=2）
+    t2 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    evts = client.get("/events", params={"dag_id": dag_id}).json()["events"]
+    claimed2 = evts[-1]
+    assert claimed2["type"] == "task.claimed"
+    assert claimed2["attempt"] == 2
+    assert claimed2["from_state"] == "pending"
+    assert claimed2["to_state"] == "running"
+
+    # 再次失败且额度耗尽（max_retries=1，failure_count=2）-> failed，后继 b -> blocked
+    client.post(f"/tasks/{t2['task_id']}/complete",
+                json={"completion_id": "c-fail-2", "lease_token": t2["lease_token"],
+                      "success": False, "error": "fatal"})
+    evts = client.get("/events", params={"dag_id": dag_id}).json()["events"]
+    failed, blocked = evts[-2], evts[-1]
+    assert failed["type"] == "task.failed"
+    assert failed["task_id"] == t2["task_id"]
+    assert failed["attempt"] == 2
+    assert failed["from_state"] == "running" and failed["to_state"] == "failed"
+    assert blocked["type"] == "task.blocked"
+    assert blocked["task_id"] != t2["task_id"]
+    assert blocked["from_state"] == "pending" and blocked["to_state"] == "blocked"
+
+    # sequence 全局严格递增，且 failed 先于 blocked
+    seqs = [e["sequence"] for e in evts]
+    assert seqs == sorted(set(seqs))
+    assert failed["sequence"] < blocked["sequence"]
+
+
+def test_succeeded_event(client):
+    submit(client, [{"key": "a"}])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    client.post(f"/tasks/{t['task_id']}/complete",
+                json={"completion_id": "c-ok", "lease_token": t["lease_token"], "success": True})
+    events = client.get("/events").json()["events"]
+    succeeded = events[-1]
+    assert succeeded["type"] == "task.succeeded"
+    assert succeeded["task_id"] == t["task_id"]
+    assert succeeded["attempt"] == 1
+    assert succeeded["from_state"] == "running"
+    assert succeeded["to_state"] == "succeeded"
+
+
+def test_claim_after_lease_expiry_event_from_running(client):
+    submit(client, [{"key": "a", "lease_seconds": 0.2}])
+    t1 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    time.sleep(0.25)
+    t2 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t2["attempt"] == 2
+    events = client.get("/events").json()["events"]
+    claimed2 = events[-1]
+    assert claimed2["type"] == "task.claimed"
+    assert claimed2["attempt"] == 2
+    assert claimed2["from_state"] == "running"  # 过期重领：任务此前停留在 running
+    assert claimed2["to_state"] == "running"
+
+
+def test_events_pagination_no_gaps_or_duplicates(client):
+    # 制造超过单页容量的事件：3 个 DAG，每个 2 个任务走完整流程
+    for i in range(3):
+        dag = submit(client, [{"key": "a"}, {"key": "b", "deps": ["a"]}], dag_id=f"page-{i}")
+        for _ in range(2):
+            t = client.post("/tasks/claim", json={"dag_id": dag["id"]}).json()["claimed"][0]
+            client.post(f"/tasks/{t['task_id']}/complete",
+                        json={"completion_id": f"c-{i}-{t['task_key']}",
+                              "lease_token": t["lease_token"], "success": True})
+
+    full = client.get("/events", params={"limit": 100}).json()["events"]
+    assert len(full) > 3
+
+    # 逐页（limit=1）拉取应与一次性拉取完全一致
+    paged = _all_events(client, limit=1)
+    assert [e["sequence"] for e in paged] == [e["sequence"] for e in full]
+
+    # 末页之后再翻页：空页沿用 after
+    last_seq = full[-1]["sequence"]
+    tail = client.get("/events", params={"after": last_seq, "limit": 10}).json()
+    assert tail == {"events": [], "next_after": last_seq}
+
+
+def test_events_filter_by_dag_id_across_global_sequence(client):
+    d1 = submit(client, [{"key": "a"}], dag_id="f-1")
+    d2 = submit(client, [{"key": "x"}], dag_id="f-2")
+    for dag in (d1, d2):
+        t = client.post("/tasks/claim", json={"dag_id": dag["id"]}).json()["claimed"][0]
+        client.post(f"/tasks/{t['task_id']}/complete",
+                    json={"completion_id": f"c-{dag['id']}",
+                          "lease_token": t["lease_token"], "success": True})
+
+    paged = _all_events(client, dag_id="f-1", limit=1)
+    assert {e["dag_id"] for e in paged} == {"f-1"}
+    assert [e["type"] for e in paged] == ["dag.created", "task.claimed", "task.succeeded"]
+
+    # 过滤后无新事件：空页沿用传入的全局 after
+    tail = client.get("/events", params={"dag_id": "f-1", "after": 10_000}).json()
+    assert tail == {"events": [], "next_after": 10_000}
+
+
+def test_events_default_params(client):
+    submit(client, [{"key": "a"}])
+    body = client.get("/events").json()
+    assert body["next_after"] == body["events"][-1]["sequence"]
+    assert body["events"][0]["type"] == "dag.created"
+
+
+def test_events_rejects_invalid_params(client):
+    assert client.get("/events", params={"limit": 0}).status_code == 422
+    assert client.get("/events", params={"limit": 101}).status_code == 422
+    assert client.get("/events", params={"after": -1}).status_code == 422
+
+
+def test_idempotent_replay_emits_no_event(client):
+    submit(client, [{"key": "a"}])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    payload = {"completion_id": "c1", "lease_token": t["lease_token"], "success": True}
+    assert client.post(f"/tasks/{t['task_id']}/complete", json=payload).status_code == 200
+    before = client.get("/events", params={"limit": 100}).json()["events"]
+
+    # 幂等重放不产生新事件
+    assert client.post(f"/tasks/{t['task_id']}/complete", json=payload).status_code == 200
+    after = client.get("/events", params={"limit": 100}).json()["events"]
+    assert [e["sequence"] for e in after] == [e["sequence"] for e in before]
+
+
+def test_failed_submit_rolls_back_event(client):
+    submit(client, [{"key": "a"}], dag_id="dup-dag")
+    # 重复 DAG id：dag 行插入即冲突，整个事务回滚，不留第二条创建事件
+    r = client.post("/dags", json={"id": "dup-dag", "tasks": [{"key": "b"}]})
+    assert r.status_code == 409
+    events = client.get("/events", params={"dag_id": "dup-dag"}).json()["events"]
+    assert len(events) == 1 and events[0]["type"] == "dag.created"
+
+    # 图校验失败（环）发生在开事务之前：完全不留事件
+    r = client.post("/dags", json={"tasks": [{"key": "a", "deps": ["a"]}]})
+    assert r.status_code == 422
+    all_events = client.get("/events", params={"limit": 100}).json()["events"]
+    assert len(all_events) == 1
+
+
+def test_events_persist_across_restart(tmp_path, monkeypatch):
+    db_file = tmp_path / "events.db"
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("DEFAULT_LEASE_SECONDS", "30")
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as c1:
+        submit(c1, [{"key": "a"}], dag_id="restart-dag")
+
+    with TestClient(app) as c2:
+        events = c2.get("/events", params={"dag_id": "restart-dag"}).json()["events"]
+        assert len(events) == 1
+        assert events[0]["type"] == "dag.created"
+        assert events[0]["sequence"] == 1  # 重启后 sequence 不重置，不漏不重
+
+
+def test_event_stream_is_immutable_in_storage(client):
+    submit(client, [{"key": "a"}])
+    import sqlite3
+    from app.db import db_path
+
+    conn = sqlite3.connect(db_path())
+    with pytest.raises(sqlite3.Error):
+        conn.execute("UPDATE events SET event_type = 'tampered' WHERE sequence = 1")
+    conn.rollback()
+    with pytest.raises(sqlite3.Error):
+        conn.execute("DELETE FROM events")
+    conn.rollback()
+    conn.close()
+
+    events = client.get("/events").json()["events"]
+    assert events[0]["type"] == "dag.created"
